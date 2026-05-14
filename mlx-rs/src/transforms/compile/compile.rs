@@ -8,6 +8,13 @@ use crate::{error::Exception, Array};
 
 use super::{type_id_to_usize, Closure, Compiled, CompiledState, Guarded, VectorArray};
 
+/// Type-erased compiled function over an owned array slice.
+pub type BoxedCompiledSlice = Box<dyn FnMut(&[Array]) -> Result<Vec<Array>, Exception> + Send>;
+
+/// Type-erased compiled function over a borrowed array slice.
+pub type BoxedCompiledSliceRefs =
+    Box<dyn for<'a> FnMut(&[&'a Array]) -> Result<Vec<Array>, Exception> + Send>;
+
 /// Returns a compiled function that produces the same output as `f`.
 ///
 /// Please refer to the [swift binding
@@ -27,6 +34,39 @@ where
         let mut compiled = f.compile(shapeless);
         compiled.call_mut(args)
     }
+}
+
+/// Returns a boxed compiled function that accepts a slice of arrays.
+///
+/// This is useful when a compiled function must be stored behind a trait
+/// object, for example in a cache or other runtime-selected container. The
+/// returned closure owns the compiled state and erases it once when dropped.
+pub fn compile_boxed_slice<F>(f: F, shapeless: impl Into<Option<bool>>) -> BoxedCompiledSlice
+where
+    F: FnMut(&[Array]) -> Result<Vec<Array>, Exception> + Send + 'static,
+{
+    let shapeless = shapeless.into().unwrap_or(false);
+    let id = type_id_to_usize(&f);
+    let mut state = CompiledState { f, shapeless, id };
+    Box::new(move |args| state.fallible_call_mut(args))
+}
+
+/// Returns a boxed compiled function that accepts borrowed array references.
+///
+/// This variant is convenient for callers that already hold `&Array` values
+/// and want to avoid constructing a temporary owned `Array` slice just to call
+/// the compiled function.
+pub fn compile_boxed_slice_refs<F>(
+    f: F,
+    shapeless: impl Into<Option<bool>>,
+) -> BoxedCompiledSliceRefs
+where
+    F: FnMut(&[Array]) -> Result<Vec<Array>, Exception> + Send + 'static,
+{
+    let shapeless = shapeless.into().unwrap_or(false);
+    let id = type_id_to_usize(&f);
+    let mut state = CompiledState { f, shapeless, id };
+    Box::new(move |args| state.fallible_call_mut(args))
 }
 
 /// A trait for functions that can be compiled.
@@ -388,7 +428,7 @@ mod tests {
         Array,
     };
 
-    use super::compile;
+    use super::{compile, compile_boxed_slice, compile_boxed_slice_refs};
 
     fn example_fn_0(x: f32) -> f32 {
         x + 1.0
@@ -501,6 +541,47 @@ mod tests {
 
         let result = compiled(&another_args);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_compile_boxed_slice() {
+        let f = |inputs: &[Array]| -> Result<Vec<Array>, Exception> {
+            multiply(&inputs[0], &inputs[1]).map(|x| vec![x])
+        };
+
+        let i1 = ones::<f32>(&[20, 20]).unwrap();
+        let i2 = ones::<f32>(&[20, 20]).unwrap();
+        let args = [i1, i2];
+
+        let r1 = f(&args).unwrap().drain(0..1).next().unwrap();
+
+        let mut compiled = compile_boxed_slice(f, None);
+        let r2 = compiled(&args).unwrap().drain(0..1).next().unwrap();
+        assert_eq!(&r1, &r2);
+
+        let r3 = compiled(&args).unwrap().drain(0..1).next().unwrap();
+        assert_eq!(&r1, &r3);
+    }
+
+    #[test]
+    fn test_compile_boxed_slice_refs() {
+        let f = |inputs: &[Array]| -> Result<Vec<Array>, Exception> {
+            multiply(&inputs[0], &inputs[1]).map(|x| vec![x])
+        };
+
+        let i1 = ones::<f32>(&[20, 20]).unwrap();
+        let i2 = ones::<f32>(&[20, 20]).unwrap();
+        let args = [&i1, &i2];
+        let owned_args = [i1.clone(), i2.clone()];
+
+        let r1 = f(&owned_args).unwrap().drain(0..1).next().unwrap();
+
+        let mut compiled = compile_boxed_slice_refs(f, None);
+        let r2 = compiled(&args).unwrap().drain(0..1).next().unwrap();
+        assert_eq!(&r1, &r2);
+
+        let r3 = compiled(&args).unwrap().drain(0..1).next().unwrap();
+        assert_eq!(&r1, &r3);
     }
 
     #[test]
