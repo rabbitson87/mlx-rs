@@ -76,6 +76,23 @@ fn build_and_link_mlx_c() {
         config.define("MLX_BUILD_ACCELERATE", "ON");
     }
 
+    // Layer B Phase 0: when MLX_LOCAL_SOURCE_DIR is set, redirect mlx-c's
+    // FetchContent_Declare(mlx ...) to a local MLX checkout. The mlx-c
+    // CMakeLists honors `MLX_LOCAL_SOURCE_DIR` directly (lumen-rs fork
+    // addition). Lets us iterate on MLX C++ patches (BufferCache eviction,
+    // MetalKernel pipeline cache, etc.) without round-tripping through GitHub.
+    // Default behavior (FetchContent of v0.30.6) is preserved when unset/empty.
+    println!("cargo:rerun-if-env-changed=MLX_LOCAL_SOURCE_DIR");
+    if let Ok(local) = env::var("MLX_LOCAL_SOURCE_DIR") {
+        if !local.is_empty() {
+            println!(
+                "cargo:warning=mlx-sys: using local MLX source at {} (Layer B)",
+                local
+            );
+            config.define("MLX_LOCAL_SOURCE_DIR", &local);
+        }
+    }
+
     // build the mlx-c project
     let dst = config.build();
 
@@ -116,6 +133,12 @@ fn main() {
         .header("src/mlx-c/mlx/c/linalg.h")
         .header("src/mlx-c/mlx/c/error.h")
         .header("src/mlx-c/mlx/c/transforms_impl.h")
+        // lumen-rs Phase 1.5 deep-dive: expose mlx_metal_start_capture /
+        // mlx_metal_stop_capture so .gputrace files can be recorded from
+        // Rust for head-to-head comparison vs mlx-lm.
+        .header("src/mlx-c/mlx/c/metal.h")
+        // lumen-rs Phase 1.8 M4.8: bf16 flash-attention primitive C ABI.
+        .header("src/mlx-c/mlx/c/lumen.h")
         .clang_arg("-Isrc/mlx-c")
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         .generate()

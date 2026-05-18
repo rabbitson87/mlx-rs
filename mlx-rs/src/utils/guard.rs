@@ -1,11 +1,129 @@
 use half::{bf16, f16};
 use mlx_sys::{__BindgenComplex, bfloat16_t, float16_t, mlx_array};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use crate::{complex64, error::Exception, Array};
 
 use super::{VectorArray, SUCCESS};
 
 type Status = i32;
+
+/// Atomic counter for total `Guarded::try_from_op` invocations across the
+/// process. Bumped once per mlx-c entry call (every mlx-rs op constructs
+/// goes through this single path). Used by lumen-rs's G6-G audit to
+/// directly count per-step mlx-c primitive constructions on the native
+/// path — see `crates/turboquant-mlx/src/runner_native.rs` and
+/// `.ai/memory/active/native-pyo3-gap-closure/CHECKLIST.md` §G6-G.
+pub static OP_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+/// Fast-path gate for op instrumentation. When `false` (default), the
+/// `try_from_op` hot path skips the atomic counter bump AND the callsite
+/// recording — costs ~30-40 ns/call combined; over 3,000+ ops/step that's
+/// ~0.1 ms wasted on disabled instrumentation. Set to `true` only when
+/// counting is requested via `reset_op_counter()` (idempotent).
+/// Class B optimization landed 2026-05-11 (mlx-rs fork patch).
+pub static INSTRUMENT_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Read the current value of `OP_COUNTER`.
+pub fn read_op_counter() -> usize {
+    OP_COUNTER.load(Ordering::Relaxed)
+}
+
+/// Reset `OP_COUNTER` to 0 and return the previous value. Also enables the
+/// instrumentation fast-path gate so subsequent `try_from_op` calls bump
+/// the counter. (Idempotent — repeated resets are fine; pair with
+/// `take_op_breakdown` / `take_op_timing` which disable their own gates.)
+pub fn reset_op_counter() -> usize {
+    INSTRUMENT_ENABLED.store(true, Ordering::Release);
+    OP_COUNTER.swap(0, Ordering::Relaxed)
+}
+
+/// Per-callsite histogram of `try_from_op` invocations (G6-G breakdown).
+/// Key = `"file:line"` from `#[track_caller]` location, value = count.
+/// Activated only when `LUMEN_NATIVE_COUNT_OPS_BREAKDOWN=1` is set —
+/// the Mutex acquire adds nonzero per-op overhead, so off by default.
+pub static OP_BREAKDOWN: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
+
+/// Enable per-callsite breakdown collection. Subsequent `try_from_op`
+/// calls will record their caller location into `OP_BREAKDOWN`. Also
+/// flips `INSTRUMENT_ENABLED` to unlock the instrumentation fast path.
+pub fn enable_op_breakdown() {
+    let mut guard = OP_BREAKDOWN.lock().unwrap();
+    *guard = Some(HashMap::new());
+    INSTRUMENT_ENABLED.store(true, Ordering::Release);
+}
+
+/// Disable breakdown collection and return the current histogram sorted
+/// descending by count.
+pub fn take_op_breakdown() -> Vec<(String, usize)> {
+    let mut guard = OP_BREAKDOWN.lock().unwrap();
+    if let Some(map) = guard.take() {
+        let mut v: Vec<(String, usize)> = map.into_iter().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v
+    } else {
+        Vec::new()
+    }
+}
+
+#[inline(always)]
+fn record_op_callsite(loc: &std::panic::Location<'static>) {
+    if let Ok(mut guard) = OP_BREAKDOWN.try_lock() {
+        if let Some(map) = guard.as_mut() {
+            let key = format!("{}:{}", loc.file(), loc.line());
+            *map.entry(key).or_insert(0) += 1;
+        }
+    }
+}
+
+/// Per-callsite wallclock timing (G6-G+ precision). Value tuple = (count, total_ns).
+/// Activated only when `LUMEN_NATIVE_TIME_OPS_BREAKDOWN=1`. Wraps the FFI call
+/// `f(guard.as_mut_raw_ptr())` with `Instant::now()` deltas — adds ~30-50 ns/op
+/// overhead so off by default.
+pub static OP_TIMING: Mutex<Option<HashMap<String, (usize, u128)>>> = Mutex::new(None);
+
+/// Fast-path flag avoiding Mutex acquire on hot try_from_op when timing is off.
+pub static OP_TIMING_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Enable timing collection. Subsequent `try_from_op` calls wrap the FFI
+/// call in `Instant::now()` deltas keyed by `#[track_caller]` location.
+/// Also flips `INSTRUMENT_ENABLED` to unlock the instrumentation fast path
+/// (timing requires the caller location which is only captured when the
+/// instrument gate is open).
+pub fn enable_op_timing() {
+    let mut g = OP_TIMING.lock().unwrap();
+    *g = Some(HashMap::new());
+    OP_TIMING_ENABLED.store(true, Ordering::Release);
+    INSTRUMENT_ENABLED.store(true, Ordering::Release);
+}
+
+/// Disable timing collection and return (callsite, count, total_ns) sorted desc by total_ns.
+pub fn take_op_timing() -> Vec<(String, usize, u128)> {
+    OP_TIMING_ENABLED.store(false, Ordering::Release);
+    let mut g = OP_TIMING.lock().unwrap();
+    if let Some(map) = g.take() {
+        let mut v: Vec<(String, usize, u128)> =
+            map.into_iter().map(|(k, (c, t))| (k, c, t)).collect();
+        v.sort_by(|a, b| b.2.cmp(&a.2));
+        v
+    } else {
+        Vec::new()
+    }
+}
+
+#[inline(always)]
+fn record_op_timing(loc: &std::panic::Location<'static>, elapsed_ns: u128) {
+    if let Ok(mut guard) = OP_TIMING.try_lock() {
+        if let Some(map) = guard.as_mut() {
+            let key = format!("{}:{}", loc.file(), loc.line());
+            let entry = map.entry(key).or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 += elapsed_ns;
+        }
+    }
+}
 
 pub trait Guard<T>: Default {
     type MutRawPtr;
@@ -21,15 +139,37 @@ pub(crate) trait Guarded: Sized {
     type Guard: Guard<Self>;
 
     #[track_caller]
+    #[inline]
     fn try_from_op<F>(f: F) -> Result<Self, Exception>
     where
         F: FnOnce(<Self::Guard as Guard<Self>>::MutRawPtr) -> Status,
     {
+        // Fast path: instrumentation gated behind a single atomic-relaxed
+        // load. Default OFF; cost when disabled = ~2-3 ns/call vs ~30-40
+        // ns/call when bumping counter + locking breakdown map. Class B
+        // optimization (2026-05-11): saves ~0.1 ms/step on 3,000+ op steps.
+        let instrument = INSTRUMENT_ENABLED.load(Ordering::Relaxed);
+        let timing_start = if instrument && OP_TIMING_ENABLED.load(Ordering::Relaxed) {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let caller_opt: Option<&'static std::panic::Location<'static>> = if instrument {
+            OP_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let c = std::panic::Location::caller();
+            record_op_callsite(c);
+            Some(c)
+        } else {
+            None
+        };
         crate::error::INIT_ERR_HANDLER
             .with(|init| init.call_once(crate::error::setup_mlx_error_handler));
 
         let mut guard = Self::Guard::default();
         let status = f(guard.as_mut_raw_ptr());
+        if let (Some(start), Some(c)) = (timing_start, caller_opt) {
+            record_op_timing(c, start.elapsed().as_nanos());
+        }
         match status {
             SUCCESS => {
                 guard.set_init_success(true);
@@ -381,7 +521,10 @@ impl Guard<crate::Stream> for MaybeUninitStream {
 
     fn try_into_guarded(self) -> Result<crate::Stream, Exception> {
         debug_assert!(self.init_success);
-        Ok(crate::Stream { c_stream: self.ptr })
+        Ok(crate::Stream {
+            c_stream: self.ptr,
+            borrowed: false,
+        })
     }
 }
 
