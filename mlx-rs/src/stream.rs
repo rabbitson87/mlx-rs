@@ -14,8 +14,21 @@ thread_local! {
 ///
 /// This is NOT intended to be used directly in most cases. Instead, use the
 /// `with_default_stream` function to temporarily set a default stream for a closure.
+///
+/// Performance: returns a *borrowed* `Stream` (Drop is a no-op) that shares
+/// the underlying `mlx_stream` handle with the actual task-local storage.
+/// This avoids ~1200 atomic refcount bumps per Gemma 4 decode step from
+/// `mlx_stream_set` + matching `mlx_stream_free`. The owning `Stream` lives
+/// inside `TASK_LOCAL_DEFAULT_STREAM` (set by `with_new_default_stream`); the
+/// borrowed clone returned here cannot outlive that owner safely, but the
+/// caller pattern (single op call) ensures the owner stays alive.
 pub fn task_local_default_stream() -> Option<Stream> {
-    TASK_LOCAL_DEFAULT_STREAM.with_borrow(|s| s.clone())
+    TASK_LOCAL_DEFAULT_STREAM.with_borrow(|s| {
+        s.as_ref().map(|owner| Stream {
+            c_stream: owner.c_stream,
+            borrowed: true,
+        })
+    })
 }
 
 /// Use a given default stream for the duration of the closure `f`.
@@ -108,6 +121,15 @@ impl std::fmt::Display for StreamOrDevice {
 /// Typically, this is used via the `stream:` parameter on a method with a [StreamOrDevice]:
 pub struct Stream {
     pub(crate) c_stream: mlx_sys::mlx_stream,
+    /// When `true`, this `Stream` is a *non-owning view* of the underlying
+    /// `mlx_stream`: `Drop` is a no-op (no `mlx_stream_free`). Used by the
+    /// `default_device` macro path (`task_local_default_stream`) to avoid
+    /// per-op atomic refcount bumps on the shared default-stream handle —
+    /// each macro op was previously triggering `mlx_stream_set` + matching
+    /// `mlx_stream_free`, totaling ~1200 atomic refcount ops per Gemma 4
+    /// decode step. The contention with mlx::core's scheduler thread was
+    /// hypothesized to inflate GPU async_eval wall-time.
+    pub(crate) borrowed: bool,
 }
 
 impl AsRef<Stream> for Stream {
@@ -119,6 +141,10 @@ impl AsRef<Stream> for Stream {
 impl Clone for Stream {
     fn clone(&self) -> Self {
         Stream::try_from_op(|res| unsafe { mlx_sys::mlx_stream_set(res, self.c_stream) })
+            .map(|mut s| {
+                s.borrowed = false;
+                s
+            })
             .expect("Failed to clone stream")
     }
 }
@@ -154,7 +180,10 @@ impl Stream {
             mlx_sys::mlx_get_default_stream(&mut c_stream as *mut _, dev);
 
             mlx_sys::mlx_device_free(dev);
-            Stream { c_stream }
+            Stream {
+                c_stream,
+                borrowed: false,
+            }
         }
     }
 
@@ -167,7 +196,10 @@ impl Stream {
     pub fn new_with_device(device: &Device) -> Stream {
         unsafe {
             let c_stream = mlx_sys::mlx_stream_new_device(device.c_device);
-            Stream { c_stream }
+            Stream {
+                c_stream,
+                borrowed: false,
+            }
         }
     }
 
@@ -180,7 +212,10 @@ impl Stream {
     pub fn cpu() -> Self {
         unsafe {
             let c_stream = mlx_sys::mlx_default_cpu_stream_new();
-            Stream { c_stream }
+            Stream {
+                c_stream,
+                borrowed: false,
+            }
         }
     }
 
@@ -188,7 +223,10 @@ impl Stream {
     pub fn gpu() -> Self {
         unsafe {
             let c_stream = mlx_sys::mlx_default_gpu_stream_new();
-            Stream { c_stream }
+            Stream {
+                c_stream,
+                borrowed: false,
+            }
         }
     }
 
@@ -216,7 +254,9 @@ impl Stream {
 
 impl Drop for Stream {
     fn drop(&mut self) {
-        unsafe { mlx_sys::mlx_stream_free(self.c_stream) };
+        if !self.borrowed {
+            unsafe { mlx_sys::mlx_stream_free(self.c_stream) };
+        }
     }
 }
 

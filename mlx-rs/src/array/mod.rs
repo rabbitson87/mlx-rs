@@ -102,6 +102,43 @@ impl Array {
         self.c_array
     }
 
+    /// Phase 1.8 (lumen-rs custom Metal kernel bridge): return the
+    /// underlying `MTL::Buffer*` for this array, cast as `*const c_void`.
+    ///
+    /// Caller MUST cast this to `MTL::Buffer*` and pass directly to
+    /// `MTLComputeCommandEncoder::setBuffer:offset:atIndex:` together with
+    /// the byte offset from [`Self::metal_byte_offset`].
+    ///
+    /// Returns `None` if the array is not evaluated yet (lazy graph state)
+    /// or not on the Metal backend. **Caller MUST call [`Self::eval`]
+    /// before this** to ensure the buffer is materialized.
+    ///
+    /// The returned pointer is owned by mlx-c and remains valid for the
+    /// lifetime of this `Array` (refcount-managed). Caller MUST NOT free.
+    ///
+    /// # Safety
+    /// While the function itself is safe (returns `Option`), using the
+    /// returned pointer in a Metal compute pipeline is `unsafe` — caller
+    /// is responsible for:
+    ///   - Casting to `MTL::Buffer*` correctly (objc2 / metal-rs wrapper).
+    ///   - Synchronizing with mlx-c's command queue if mixing dispatches.
+    ///   - Not retaining beyond the `Array`'s lifetime.
+    pub fn metal_buffer_ptr(&self) -> Option<*const std::ffi::c_void> {
+        let p = unsafe { mlx_sys::_mlx_array_metal_buffer(self.c_array) };
+        if p.is_null() {
+            None
+        } else {
+            Some(p)
+        }
+    }
+
+    /// Phase 1.8: return the byte offset of element `[0, 0, ...]` within
+    /// the array's Metal backing buffer. Pair with [`Self::metal_buffer_ptr`]
+    /// when binding to a Metal compute encoder.
+    pub fn metal_byte_offset(&self) -> usize {
+        unsafe { mlx_sys::_mlx_array_byte_offset(self.c_array) }
+    }
+
     /// New array from a bool scalar.
     pub fn from_bool(val: bool) -> Array {
         let c_array = unsafe { mlx_sys::mlx_array_new_bool(val) };

@@ -377,6 +377,59 @@ impl<F> CompiledState<F> {
     }
 }
 
+/// Compile a fallible function and return a type-erased boxed closure.
+///
+/// Unlike [`compile()`], which constructs a fresh `Compiled<F, G>` wrapper on
+/// every call (incurring a per-call alloc + `mlx_detail_compile_erase` from
+/// `Compiled`'s `Drop`), this returns a `Box<dyn FnMut(&[Array]) -> _ + Send>`
+/// whose argument lifetime is HRTB-natural — meaning the returned box can be
+/// stored persistently in containers like `OnceLock<Mutex<Box<...>>>` and
+/// reused across calls without re-creating the wrapper each time.
+///
+/// The returned box owns the underlying compile state. The mlx-c side compile
+/// cache entry is preserved as long as the box is alive; when the box is
+/// dropped, `mlx_detail_compile_erase` runs once.
+///
+/// Use this when the per-call wrapper alloc/Drop cost from [`compile()`] is a
+/// measurable bottleneck (~25-30μs per call observed for `Compiled` struct
+/// alloc + drop on Apple Silicon).
+pub fn compile_boxed_slice<F>(
+    f: F,
+    shapeless: bool,
+) -> Box<dyn FnMut(&[Array]) -> Result<Vec<Array>, Exception> + Send>
+where
+    F: FnMut(&[Array]) -> Result<Vec<Array>, Exception> + 'static + Send,
+{
+    let id = type_id_to_usize(&f);
+    let mut state = CompiledState { f, shapeless, id };
+    Box::new(move |args: &[Array]| state.fallible_call_mut(args))
+}
+
+/// Ref-variant of [`compile_boxed_slice`]. Returns a box whose argument is
+/// `&[&Array]` instead of `&[Array]`, avoiding the per-call refcount-bump
+/// `Array::clone()` FFI invocations that callers otherwise incur when
+/// constructing `[a.clone(), b.clone()]` arrays before dispatch.
+///
+/// The inner `f` still takes `&[Array]` because that's what mlx-c hands back
+/// when it resolves the traced graph — only the outer dispatch slice's element
+/// type differs. Underlying `CompiledState::fallible_call_mut` accepts
+/// `&[impl AsRef<Array>]`, which `&[&Array]` satisfies via the std blanket
+/// `impl<T> AsRef<U> for &T where T: AsRef<U>` plus `impl AsRef<Array> for Array`.
+///
+/// Use this when the caller already holds tensors as references and would
+/// otherwise need to clone them just to satisfy the slice element type.
+pub fn compile_boxed_slice_refs<F>(
+    f: F,
+    shapeless: bool,
+) -> Box<dyn for<'a> FnMut(&[&'a Array]) -> Result<Vec<Array>, Exception> + Send>
+where
+    F: FnMut(&[Array]) -> Result<Vec<Array>, Exception> + 'static + Send,
+{
+    let id = type_id_to_usize(&f);
+    let mut state = CompiledState { f, shapeless, id };
+    Box::new(move |args: &[&Array]| state.fallible_call_mut(args))
+}
+
 #[cfg(test)]
 mod tests {
     use core::panic;

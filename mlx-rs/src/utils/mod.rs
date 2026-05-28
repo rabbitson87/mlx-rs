@@ -16,6 +16,15 @@ pub(crate) const FAILURE: i32 = 1;
 pub(crate) mod guard;
 pub(crate) mod io;
 
+/// Public re-export of the `Guarded::try_from_op` invocation counter and
+/// its read/reset helpers. Used by lumen-rs to directly measure per-step
+/// mlx-c entry call counts on the native path — see CHECKLIST §G6-G in
+/// `.ai/memory/active/native-pyo3-gap-closure/`.
+pub use guard::{
+    enable_op_breakdown, enable_op_timing, read_op_counter, reset_op_counter, take_op_breakdown,
+    take_op_timing, OP_BREAKDOWN, OP_COUNTER, OP_TIMING, OP_TIMING_ENABLED,
+};
+
 pub(crate) fn resolve_index_signed_unchecked(index: i32, len: i32) -> i32 {
     if index < 0 {
         len.saturating_add(index)

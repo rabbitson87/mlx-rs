@@ -8,6 +8,59 @@ use crate::utils::IntoOption;
 use crate::{Array, Stream};
 use mlx_internal_macros::{default_device, generate_macro};
 
+// lumen-rs Phase 1.6 — mlx-rs SDPA wrapper stage timing.
+// Splits `scaled_dot_product_attention_device` into:
+//   - pre_ffi: build mask_mode/mask_arr decision, gather pointer args
+//   - try_from_op_total: the Array::try_from_op call (Guard alloc + FFI
+//     + try_into_guarded). This + mlx-c wrapper TOTAL should match.
+//
+// Compared with mlx-c wrapper TOTAL (~1.3 μs/call at 4K) and Rust
+// `attn.sdpa` bucket (~770 μs/call at 4K), this localizes which side
+// of the mlx-rs / mlx-c boundary owns the cost.
+//
+// Activated via `LUMEN_MLXRS_SDPA_TIMING_DUMP=1`. Read via the
+// `mlxrs_dump_sdpa_timing()` extern-C-like Rust entry from lumen-rs.
+#[doc(hidden)]
+pub mod sdpa_timing {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub static CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static PRE_FFI_NS: AtomicU64 = AtomicU64::new(0);
+    pub static TRY_FROM_OP_NS: AtomicU64 = AtomicU64::new(0);
+    pub static TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+
+    pub fn reset() {
+        CALLS.store(0, Ordering::Relaxed);
+        PRE_FFI_NS.store(0, Ordering::Relaxed);
+        TRY_FROM_OP_NS.store(0, Ordering::Relaxed);
+        TOTAL_NS.store(0, Ordering::Relaxed);
+    }
+
+    pub fn dump() {
+        let calls = CALLS.load(Ordering::Relaxed);
+        if calls == 0 {
+            eprintln!("[mlxrs-sdpa-timing] no SDPA calls observed");
+            return;
+        }
+        let fmt = |name: &str, bucket: &AtomicU64| {
+            let ns = bucket.load(Ordering::Relaxed);
+            let total_ms = ns as f64 / 1e6;
+            let per_call_us = ns as f64 / 1000.0 / calls as f64;
+            eprintln!(
+                "[mlxrs-sdpa-timing] {:<22} {:10.3} ms total   {:10.3} us/call",
+                name, total_ms, per_call_us
+            );
+        };
+        eprintln!(
+            "[mlxrs-sdpa-timing] === mlx-rs SDPA wrapper breakdown (calls={}) ===",
+            calls
+        );
+        fmt("pre_ffi", &PRE_FFI_NS);
+        fmt("try_from_op", &TRY_FROM_OP_NS);
+        fmt("TOTAL", &TOTAL_NS);
+    }
+}
+
 /// Optimized implementation of `NN.RoPE`.
 #[allow(clippy::too_many_arguments)]
 #[generate_macro(customize(root = "$crate::fast"))]
@@ -152,12 +205,18 @@ pub fn scaled_dot_product_attention_device<'a>(
     #[optional] sinks: impl Into<Option<&'a Array>>,
     #[optional] stream: impl AsRef<Stream>,
 ) -> Result<Array> {
+    use std::sync::atomic::Ordering;
+    use std::time::Instant;
+    let t_start = Instant::now();
+
     let (mask_mode, mask_arr) = mask.into_option().map_or_else(
         || (DEFAULT_MASK_MODE, unsafe { mlx_sys::mlx_array_new() }),
         |m| m.as_mode_and_mask(),
     );
+    let t_after_pre = Instant::now();
+    sdpa_timing::PRE_FFI_NS.fetch_add((t_after_pre - t_start).as_nanos() as u64, Ordering::Relaxed);
 
-    Array::try_from_op(|res| unsafe {
+    let result = Array::try_from_op(|res| unsafe {
         mlx_sys::mlx_fast_scaled_dot_product_attention(
             res,
             queries.as_ref().as_ptr(),
@@ -172,7 +231,13 @@ pub fn scaled_dot_product_attention_device<'a>(
                 .unwrap_or(mlx_sys::mlx_array_new()),
             stream.as_ref().as_ptr(),
         )
-    })
+    });
+    let t_end = Instant::now();
+    sdpa_timing::TRY_FROM_OP_NS
+        .fetch_add((t_end - t_after_pre).as_nanos() as u64, Ordering::Relaxed);
+    sdpa_timing::TOTAL_NS.fetch_add((t_end - t_start).as_nanos() as u64, Ordering::Relaxed);
+    sdpa_timing::CALLS.fetch_add(1, Ordering::Relaxed);
+    result
 }
 
 /// Root Mean Square normalization (RMS norm).
