@@ -107,6 +107,13 @@ fn build_and_link_mlx_c() {
     #[cfg(feature = "metal")]
     {
         println!("cargo:rustc-link-lib=framework=Metal");
+        // The kernel library this MLX build loads, for dependents that ship or
+        // embed it: `links = "mlx"` exposes it to their build scripts as
+        // `DEP_MLX_METALLIB`, and orders those scripts after this one.
+        let metallib = dst.join("build/lib/mlx.metallib");
+        if metallib.exists() {
+            println!("cargo:metallib={}", metallib.display());
+        }
     }
 
     #[cfg(feature = "accelerate")]

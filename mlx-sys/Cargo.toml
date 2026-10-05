@@ -1,6 +1,10 @@
 [package]
 name = "mlx-sys"
 version = "0.2.0" # mlx-sys version should follow that of mlx-c
+# Declared so dependents' build scripts run after this one and receive
+# `DEP_MLX_METALLIB` (see build.rs) — a crate that embeds the kernel library
+# otherwise races the MLX build for it.
+links = "mlx"
 authors.workspace = true
 edition.workspace = true
 
